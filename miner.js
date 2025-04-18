@@ -26,7 +26,7 @@ class KaleidoMiningBot {
             powerUsage: 120
         };
         this.sessionFile = `session_${wallet}.json`;
-        
+
         this.api = axios.create({
             baseURL: 'https://kaleidofinance.xyz/api/testnet',
             headers: {
@@ -35,6 +35,15 @@ class KaleidoMiningBot {
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36'
             }
         });
+    }
+
+    validateEarnings(earnings) {
+        return (
+            typeof earnings === 'number' &&
+            !isNaN(earnings) &&
+            isFinite(earnings) &&
+            earnings >= 0
+        );
     }
 
     async loadSession() {
@@ -57,17 +66,16 @@ class KaleidoMiningBot {
             earnings: this.currentEarnings,
             referralBonus: this.referralBonus
         };
-        
+
         try {
             await fs.writeFile(this.sessionFile, JSON.stringify(sessionData, null, 2));
         } catch (error) {
-            console.error(chalk.red(`[Wallet ${this.botIndex}] Failed to save session:`, error.message));
+            console.error(chalk.red(`[Wallet ${this.botIndex}] Failed to save session:`), error.message);
         }
     }
 
     async initialize() {
         try {
-            // 1. Check registration status
             const regResponse = await this.retryRequest(
                 () => this.api.get(`/check-registration?wallet=${this.wallet}`),
                 "Registration check"
@@ -77,28 +85,31 @@ class KaleidoMiningBot {
                 throw new Error('Wallet not registered');
             }
 
-            // 2. Try to load previous session
             const hasSession = await this.loadSession();
-            
+
             if (!hasSession) {
-                // Only initialize new values if no previous session exists
-                this.referralBonus = regResponse.data.userData.referralBonus;
+                this.referralBonus = regResponse.data.userData.referralBonus || 0;
                 this.currentEarnings = {
-                    total: regResponse.data.userData.referralBonus || 0,
+                    total: this.referralBonus,
                     pending: 0,
                     paid: 0
                 };
                 this.miningState.startTime = Date.now();
+            } else if (!this.miningState.startTime) {
+                this.miningState.startTime = Date.now();
             }
 
-            // 3. Start mining session
             this.miningState.isActive = true;
-            
+
             console.log(chalk.green(`[Wallet ${this.botIndex}] Mining ${hasSession ? 'resumed' : 'initialized'} successfully`));
             await this.startMiningLoop();
 
         } catch (error) {
-            console.error(chalk.red(`[Wallet ${this.botIndex}] Initialization failed:`), error.message);
+            if (error.response) {
+                console.error(chalk.red(`[Wallet ${this.botIndex}] Init Error ${error.response.status}: ${JSON.stringify(error.response.data)}`));
+            } else {
+                console.error(chalk.red(`[Wallet ${this.botIndex}] Initialization failed:`), error.message);
+            }
         }
     }
 
@@ -115,6 +126,10 @@ class KaleidoMiningBot {
     }
 
     calculateEarnings() {
+        if (!this.miningState.startTime) {
+            console.warn(chalk.red(`[Wallet ${this.botIndex}] Missing startTime, returning 0 earnings`));
+            return 0;
+        }
         const timeElapsed = (Date.now() - this.miningState.startTime) / 1000;
         return (this.stats.hashrate * timeElapsed * 0.0001) * (1 + this.referralBonus);
     }
@@ -122,6 +137,12 @@ class KaleidoMiningBot {
     async updateBalance(finalUpdate = false) {
         try {
             const newEarnings = this.calculateEarnings();
+
+            if (!this.validateEarnings(newEarnings)) {
+                console.error(chalk.red(`[Wallet ${this.botIndex}] Invalid earnings value.`));
+                return;
+            }
+
             const payload = {
                 wallet: this.wallet,
                 earnings: {
@@ -142,19 +163,25 @@ class KaleidoMiningBot {
                     pending: finalUpdate ? 0 : newEarnings,
                     paid: finalUpdate ? this.currentEarnings.paid + newEarnings : this.currentEarnings.paid
                 };
-                
+
                 await this.saveSession();
                 this.logStatus(finalUpdate);
+            } else {
+                console.error(chalk.red(`[Wallet ${this.botIndex}] Server responded but update failed:`), response.data);
             }
         } catch (error) {
-            console.error(chalk.red(`[Wallet ${this.botIndex}] Update failed:`), error.message);
+            if (error.response) {
+                console.error(chalk.red(`[Wallet ${this.botIndex}] API Error ${error.response.status}: ${JSON.stringify(error.response.data)}`));
+            } else {
+                console.error(chalk.red(`[Wallet ${this.botIndex}] Update failed:`), error.message);
+            }
         }
     }
 
     logStatus(final = false) {
         const statusType = final ? "Final Status" : "Mining Status";
         const uptime = ((Date.now() - this.miningState.startTime) / 1000).toFixed(0);
-        
+
         console.log(chalk.yellow(`
         === [Wallet ${this.botIndex}] ${statusType} ===
         Wallet: ${this.wallet}
@@ -170,7 +197,7 @@ class KaleidoMiningBot {
     async startMiningLoop() {
         while (this.miningState.isActive) {
             await this.updateBalance();
-            await new Promise(resolve => setTimeout(resolve, 30000)); // Update every 30 seconds
+            await new Promise(resolve => setTimeout(resolve, 30000));
         }
     }
 
@@ -184,14 +211,13 @@ class KaleidoMiningBot {
 
 export class MiningCoordinator {
     static instance = null;
-    
+
     constructor() {
-        // Singleton pattern to prevent multiple instances
         if (MiningCoordinator.instance) {
             return MiningCoordinator.instance;
         }
         MiningCoordinator.instance = this;
-        
+
         this.bots = [];
         this.totalPaid = 0;
         this.isRunning = false;
@@ -203,7 +229,7 @@ export class MiningCoordinator {
             const data = await readFile(join(__dirname, 'wallets.txt'), 'utf8');
             return data.split('\n')
                 .map(line => line.trim())
-                .filter(line => line.startsWith('0x'));
+                .filter(line => /^0x[a-fA-F0-9]{40}$/.test(line));
         } catch (error) {
             console.error('Error loading wallets:', error.message);
             return [];
@@ -211,16 +237,15 @@ export class MiningCoordinator {
     }
 
     async start() {
-        // Prevent multiple starts
         if (this.isRunning) {
             console.log(chalk.yellow('Mining coordinator is already running'));
             return;
         }
-        
+
         this.isRunning = true;
         displayBanner();
         const wallets = await this.loadWallets();
-        
+
         if (wallets.length === 0) {
             console.log(chalk.red('No valid wallets found in wallets.txt'));
             return;
@@ -228,19 +253,17 @@ export class MiningCoordinator {
 
         console.log(chalk.blue(`Loaded ${wallets.length} wallets\n`));
 
-        // Initialize all bots
         this.bots = wallets.map((wallet, index) => {
             const bot = new KaleidoMiningBot(wallet, index + 1);
             bot.initialize();
             return bot;
         });
 
-        // Handle shutdown
         process.on('SIGINT', async () => {
             console.log(chalk.yellow('\nShutting down miners...'));
             this.totalPaid = (await Promise.all(this.bots.map(bot => bot.stop())))
                 .reduce((sum, paid) => sum + paid, 0);
-            
+
             console.log(chalk.green(`
             === Final Summary ===
             Total Wallets: ${this.bots.length}
